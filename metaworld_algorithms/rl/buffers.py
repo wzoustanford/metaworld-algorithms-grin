@@ -1,4 +1,5 @@
 import abc
+from collections import deque
 from typing import override
 
 import gymnasium as gym
@@ -376,6 +377,326 @@ class MultiTaskReplayBuffer(AbstractReplayBuffer):
         batch = map(lambda x: x.reshape(mt_batch_size, *x.shape[2:]), batch)
 
         return ReplayBufferSamples(*batch)
+
+
+class MultiTaskRolloutCollectionBuffer(AbstractReplayBuffer):
+    """Collection buffer storing multiple complete rollouts for off-policy learning.
+
+    Unlike MultiTaskReplayBuffer (stores individual transitions) or MultiTaskRolloutBuffer
+    (stores one rollout at a time for on-policy algorithms), this stores MANY complete
+    rollouts in a circular buffer, preserving sequential structure within each rollout.
+
+    TODO: Current capacity (2000 rollouts) assumes ~500 steps/rollout on average.
+          Need to verify actual average rollout length from data and adjust capacity
+          accordingly to match ~1M transition equivalent storage.
+    """
+
+    rollouts: deque[Rollout]
+    capacity: int
+    num_tasks: int
+    pos: int
+
+    def __init__(
+        self,
+        total_capacity: int,
+        num_tasks: int,
+        env_obs_space: gym.Space,
+        env_action_space: gym.Space,
+        max_rollout_steps: int = 500,
+        seed: int | None = None,
+    ) -> None:
+        """Initialize the rollout collection buffer.
+
+        Args:
+            total_capacity: Maximum number of rollouts to store (e.g., 2000)
+            num_tasks: Number of tasks in the multi-task environment
+            env_obs_space: Observation space from the environment
+            env_action_space: Action space from the environment
+            max_rollout_steps: Maximum timesteps per rollout (default: 500)
+            seed: Random seed for sampling
+        """
+        self.capacity = total_capacity
+        self.num_tasks = num_tasks
+        self.max_rollout_steps = max_rollout_steps
+        self._rng = np.random.default_rng(seed)
+        self._obs_shape = np.array(env_obs_space.shape).prod()
+        self._action_shape = np.array(env_action_space.shape).prod()
+        self.full = False
+
+        # Internal buffer for building current rollout
+        self._current_rollout_buffer = MultiTaskRolloutBuffer(
+            num_rollout_steps=max_rollout_steps,
+            num_tasks=num_tasks,
+            env_obs_space=env_obs_space,
+            env_action_space=env_action_space,
+            seed=seed,
+        )
+
+        self.reset()
+
+    @override
+    def reset(self) -> None:
+        """Reinitialize the buffer."""
+        self.rollouts = deque(maxlen=self.capacity)
+        self.pos = 0
+        self._current_rollout_buffer.reset()
+
+    @override
+    def checkpoint(self) -> ReplayBufferCheckpoint:
+        """Save buffer state for checkpointing."""
+        # GENERAL PRINCIPLE: StandardSave only accepts numpy arrays + simple Python types (int, bool, float)
+        # Any complex objects (NamedTuples, custom classes, etc.) must be decomposed to raw arrays
+
+        # Decompose Rollout NamedTuples into component arrays
+        # Each rollout is stored as separate arrays for observations, actions, rewards, dones
+        rollout_data = {
+            "rollout_observations": [r.observations for r in self.rollouts],
+            "rollout_actions": [r.actions for r in self.rollouts],
+            "rollout_rewards": [r.rewards for r in self.rollouts],
+            "rollout_dones": [r.dones for r in self.rollouts],
+            "num_rollouts": len(self.rollouts),
+        }
+
+        return {
+            "data": {
+                # Decomposed rollouts (list of arrays is OK for StandardSave)
+                **rollout_data,
+                "pos": int(self.pos),
+                "full": bool(self.full),
+                # Current rollout buffer arrays and position
+                "current_rollout_observations": self._current_rollout_buffer.observations,
+                "current_rollout_actions": self._current_rollout_buffer.actions,
+                "current_rollout_rewards": self._current_rollout_buffer.rewards,
+                "current_rollout_dones": self._current_rollout_buffer.dones,
+                "current_rollout_pos": int(self._current_rollout_buffer.pos),
+            },
+            # RNG states go at top level (saved with JsonSave, not StandardSave)
+            "rng_state": {
+                "main_rng": self._rng.bit_generator.state,
+                "current_rollout_buffer_rng": self._current_rollout_buffer._rng.bit_generator.state,
+            },
+        }
+
+    @override
+    def load_checkpoint(self, ckpt: ReplayBufferCheckpoint) -> None:
+        """Load buffer state from checkpoint."""
+        for key in ["data", "rng_state"]:
+            assert key in ckpt
+
+        # Reconstruct Rollout NamedTuples from decomposed arrays
+        num_rollouts = ckpt["data"]["num_rollouts"]
+        rollouts_list = []
+        for i in range(num_rollouts):
+            rollout = Rollout(
+                observations=ckpt["data"]["rollout_observations"][i],
+                actions=ckpt["data"]["rollout_actions"][i],
+                rewards=ckpt["data"]["rollout_rewards"][i],
+                dones=ckpt["data"]["rollout_dones"][i],
+            )
+            rollouts_list.append(rollout)
+
+        # Restore main buffer state
+        self.rollouts = deque(rollouts_list, maxlen=self.capacity)
+        self.pos = ckpt["data"]["pos"]
+        self.full = ckpt["data"]["full"]
+
+        # Restore current rollout buffer arrays and position
+        self._current_rollout_buffer.observations = ckpt["data"]["current_rollout_observations"]
+        self._current_rollout_buffer.actions = ckpt["data"]["current_rollout_actions"]
+        self._current_rollout_buffer.rewards = ckpt["data"]["current_rollout_rewards"]
+        self._current_rollout_buffer.dones = ckpt["data"]["current_rollout_dones"]
+        self._current_rollout_buffer.pos = ckpt["data"]["current_rollout_pos"]
+
+        # Restore RNG states from top-level dict
+        self._rng.bit_generator.state = ckpt["rng_state"]["main_rng"]
+        self._current_rollout_buffer._rng.bit_generator.state = ckpt["rng_state"]["current_rollout_buffer_rng"]
+
+    @override
+    def add(
+        self,
+        obs: Float[Observation, " task"],
+        next_obs: Float[Observation, " task"],
+        action: Float[Action, " task"],
+        reward: Float[npt.NDArray, " task"],
+        done: Float[npt.NDArray, " task"],
+    ) -> None:
+        """Add a batch of transitions (one per task) to the current rollout being built.
+
+        Args:
+            obs: Current observations for all tasks [num_tasks, obs_dim]
+            next_obs: Next observations for all tasks [num_tasks, obs_dim]
+            action: Actions for all tasks [num_tasks, action_dim]
+            reward: Rewards for all tasks [num_tasks] or [num_tasks, 1]
+            done: Done flags for all tasks [num_tasks] or [num_tasks, 1]
+        """
+        # Add to current rollout buffer
+        self._current_rollout_buffer.add(
+            obs=obs,
+            action=action,
+            reward=reward,
+            done=done,
+        )
+
+        # Check if any episode ended or buffer is full
+        if self._current_rollout_buffer.ready or done.any():
+            self._store_current_rollout()
+
+    def _store_current_rollout(self) -> None:
+        """Store the current rollout buffer into the collection and reset it."""
+        if self._current_rollout_buffer.pos == 0:
+            return
+
+        # Get rollout (only up to current position)
+        rollout = Rollout(
+            observations=self._current_rollout_buffer.observations[: self._current_rollout_buffer.pos],
+            actions=self._current_rollout_buffer.actions[: self._current_rollout_buffer.pos],
+            rewards=self._current_rollout_buffer.rewards[: self._current_rollout_buffer.pos],
+            dones=self._current_rollout_buffer.dones[: self._current_rollout_buffer.pos],
+            log_probs=None,
+            means=None,
+            stds=None,
+            values=None,
+            rnn_states=None,
+        )
+
+        # Add to collection (deque automatically handles overflow)
+        self.rollouts.append(rollout)
+        self.pos += 1
+
+        # Mark as full when we've wrapped around
+        if len(self.rollouts) == self.capacity:
+            self.full = True
+
+        # Reset for next rollout
+        self._current_rollout_buffer.reset()
+
+    @override
+    def sample(self, batch_size: int) -> ReplayBufferSamples:
+        """Sample random transitions from stored rollouts.
+
+        Maintains backward compatibility by returning individual transitions.
+
+        Args:
+            batch_size: Total number of transitions to sample
+
+        Returns:
+            ReplayBufferSamples containing sampled transitions
+        """
+        if len(self.rollouts) == 0:
+            raise ValueError("Cannot sample from empty buffer")
+
+        num_rollouts = len(self.rollouts)
+        rollout_indices = self._rng.integers(0, num_rollouts, size=batch_size)
+
+        sampled_obs = []
+        sampled_actions = []
+        sampled_next_obs = []
+        sampled_dones = []
+        sampled_rewards = []
+
+        for rollout_idx in rollout_indices:
+            rollout = self.rollouts[rollout_idx]
+            rollout_len = rollout.observations.shape[0]
+
+            # Sample random timestep and task
+            timestep_idx = self._rng.integers(0, rollout_len)
+            task_idx = self._rng.integers(0, self.num_tasks)
+
+            # Extract transition
+            obs = rollout.observations[timestep_idx, task_idx]
+            action = rollout.actions[timestep_idx, task_idx]
+            reward = rollout.rewards[timestep_idx, task_idx]
+            done = rollout.dones[timestep_idx, task_idx]
+
+            # For next_obs, use next timestep if available
+            if timestep_idx + 1 < rollout_len:
+                next_obs = rollout.observations[timestep_idx + 1, task_idx]
+            else:
+                next_obs = obs
+
+            sampled_obs.append(obs)
+            sampled_actions.append(action)
+            sampled_next_obs.append(next_obs)
+            sampled_rewards.append(reward)
+            sampled_dones.append(done)
+
+        batch = (
+            np.array(sampled_obs, dtype=np.float32),
+            np.array(sampled_actions, dtype=np.float32),
+            np.array(sampled_next_obs, dtype=np.float32),
+            np.array(sampled_dones, dtype=np.float32).reshape(-1, 1),
+            np.array(sampled_rewards, dtype=np.float32).reshape(-1, 1),
+        )
+
+        return ReplayBufferSamples(*batch)
+
+    def sample_rollouts(
+        self, num_rollouts: int, max_length: int | None = None
+    ) -> list[Rollout]:
+        """Sample complete rollouts from the buffer.
+
+        New capability for algorithms that need sequential data.
+
+        Args:
+            num_rollouts: Number of rollouts to sample
+            max_length: If specified, truncate rollouts to this length
+
+        Returns:
+            List of Rollout objects with sequential data
+        """
+        if len(self.rollouts) == 0:
+            raise ValueError("Cannot sample from empty buffer")
+
+        num_available = len(self.rollouts)
+        rollout_indices = self._rng.integers(0, num_available, size=num_rollouts)
+
+        sampled_rollouts = []
+        for rollout_idx in rollout_indices:
+            rollout = self.rollouts[rollout_idx]
+
+            if max_length is not None:
+                current_len = rollout.observations.shape[0]
+                if current_len > max_length:
+                    rollout = Rollout(
+                        observations=rollout.observations[:max_length],
+                        actions=rollout.actions[:max_length],
+                        rewards=rollout.rewards[:max_length],
+                        dones=rollout.dones[:max_length],
+                        log_probs=None,
+                        means=None,
+                        stds=None,
+                        values=None,
+                        rnn_states=None,
+                    )
+
+            sampled_rollouts.append(rollout)
+
+        return sampled_rollouts
+
+    def get_statistics(self) -> dict[str, float]:
+        """Get statistics about stored rollouts for monitoring.
+
+        Returns:
+            Dictionary with num_rollouts, avg/min/max rollout length, total transitions
+        """
+        if len(self.rollouts) == 0:
+            return {
+                "num_rollouts": 0,
+                "avg_rollout_length": 0.0,
+                "min_rollout_length": 0,
+                "max_rollout_length": 0,
+                "total_transitions": 0,
+            }
+
+        lengths = [rollout.observations.shape[0] for rollout in self.rollouts]
+
+        return {
+            "num_rollouts": len(self.rollouts),
+            "avg_rollout_length": float(np.mean(lengths)),
+            "min_rollout_length": int(np.min(lengths)),
+            "max_rollout_length": int(np.max(lengths)),
+            "total_transitions": int(np.sum(lengths)) * self.num_tasks,
+        }
 
 
 class MultiTaskRolloutBuffer:

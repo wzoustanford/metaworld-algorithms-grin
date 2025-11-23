@@ -149,6 +149,6 @@ class MOOREConfig(NeuralNetworkConfig):
     num_tasks: int
     """The number of tasks (used for extracting the task IDs)."""
 
-    num_experts: int = 4
+    num_experts: int = 6
     """The number of orthogonal experts."""
     # Original values are 4 for MT10 and 6 for MT50

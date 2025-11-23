@@ -24,7 +24,10 @@ from metaworld_algorithms.config.networks import (
 from metaworld_algorithms.config.optim import OptimizerConfig
 from metaworld_algorithms.config.rl import AlgorithmConfig, OffPolicyTrainingConfig
 from metaworld_algorithms.optim.pcgrad import PCGradState
-from metaworld_algorithms.rl.buffers import MultiTaskReplayBuffer
+from metaworld_algorithms.rl.buffers import (
+    MultiTaskReplayBuffer,
+    MultiTaskRolloutCollectionBuffer,
+)    
 from metaworld_algorithms.rl.networks import (
     ContinuousActionPolicy,
     Ensemble,
@@ -525,3 +528,58 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
     @override
     def update(self, data: ReplayBufferSamples) -> tuple[Self, LogDict]:
         return self._update_inner(data)
+
+@dataclasses.dataclass(frozen=True)
+class MTSACSequentialConfig(MTSACConfig):
+    """Config for MTSAC with sequential rollout collection buffer.
+
+    Inherits all MTSAC config options, only changes the buffer type.
+    Uses MultiTaskRolloutCollectionBuffer instead of MultiTaskReplayBuffer.
+    """
+    rollout_capacity: int = 2000  # Number of rollouts to store
+    max_rollout_steps: int = 500  # Max steps per rollout
+
+
+class MTSACSequential(MTSAC):
+    """MTSAC variant that uses sequential rollout collection buffer.
+
+    This variant stores complete rollouts/trajectories instead of individual transitions,
+    preserving temporal structure within episodes. This may be beneficial for:
+    - Learning temporal patterns
+    - Future extension to sequence models (RNNs, Transformers)
+    - Analyzing sequential decision-making
+
+    The training loop and update logic remain identical to standard MTSAC.
+    Only the replay buffer type changes.
+    """
+
+    rollout_capacity: int = struct.field(pytree_node=False)
+    max_rollout_steps: int = struct.field(pytree_node=False)
+
+    @override
+    @staticmethod
+    def initialize(
+        config: MTSACSequentialConfig, env_config: EnvConfig, seed: int = 1
+    ) -> "MTSACSequential":
+        """Initialize MTSACSequential (delegates to MTSAC.initialize)."""
+        # Call MTSAC.initialize and add sequential-specific fields
+        mtsac = MTSAC.initialize(config, env_config, seed)
+        return MTSACSequential(
+            **{k: getattr(mtsac, k) for k in mtsac.__dataclass_fields__.keys()},
+            rollout_capacity=config.rollout_capacity,
+            max_rollout_steps=config.max_rollout_steps,
+        )
+
+    @override
+    def spawn_replay_buffer(
+        self, env_config: EnvConfig, config: OffPolicyTrainingConfig, seed: int = 1
+    ) -> MultiTaskRolloutCollectionBuffer:
+        """Spawn sequential rollout collection buffer instead of standard replay buffer."""
+        return MultiTaskRolloutCollectionBuffer(
+            total_capacity=self.rollout_capacity,
+            num_tasks=self.num_tasks,
+            env_obs_space=env_config.observation_space,
+            env_action_space=env_config.action_space,
+            max_rollout_steps=self.max_rollout_steps,
+            seed=seed,
+        )
