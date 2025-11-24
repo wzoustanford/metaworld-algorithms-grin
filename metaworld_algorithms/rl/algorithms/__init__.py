@@ -1,7 +1,7 @@
 from metaworld_algorithms.config.rl import AlgorithmConfig
 
 from .base import Algorithm, OffPolicyAlgorithm
-from .mtsac import MTSAC, MTSACConfig
+from .mtsac import MTSAC, MTSACConfig, MTSACSequential, MTSACSequentialConfig
 from .ppo import PPOConfig, PPO
 from .sac import SAC, SACConfig
 from .mamltrpo import MAMLTRPO, MAMLTRPOConfig
@@ -9,7 +9,9 @@ from .rl2 import RL2, RL2Config
 
 
 def get_algorithm_for_config(config: AlgorithmConfig) -> type[Algorithm]:
-    if type(config) is MTSACConfig:
+    if type(config) is MTSACSequentialConfig:
+        return MTSACSequential
+    elif type(config) is MTSACConfig:
         return MTSAC
     elif type(config) is PPOConfig:
         return PPO
@@ -27,7 +29,9 @@ __all__ = [
     "Algorithm",
     "OffPolicyAlgorithm",
     "MTSAC",
+    "MTSACSequential",
     "PPO",
     "MTSACConfig",
+    "MTSACSequentialConfig",
     "PPOConfig",
 ]

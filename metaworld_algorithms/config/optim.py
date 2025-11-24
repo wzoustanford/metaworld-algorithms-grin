@@ -24,7 +24,7 @@ class OptimizerConfig:
         # From https://github.com/araffin/sbx/blob/master/sbx/ppo/policies.py#L120
         optim_kwargs = {}
         if self.optimizer == Optimizer.Adam:
-            optim_kwargs["eps"] = 1e-5
+            optim_kwargs["eps"] = 1e-8
 
         optim = self.optimizer(learning_rate=self.lr, **optim_kwargs)
         if self.max_grad_norm is not None:
