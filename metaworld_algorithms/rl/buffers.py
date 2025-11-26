@@ -571,7 +571,7 @@ class MultiTaskRolloutCollectionBuffer(AbstractReplayBuffer):
         self._current_rollout_buffer.reset()
 
     @override
-    def sample(self, batch_size: int) -> ReplayBufferSamples:
+    def sample_no_seq(self, batch_size: int) -> ReplayBufferSamples:
         """Sample random transitions from stored rollouts.
 
         Maintains backward compatibility by returning individual transitions.
@@ -673,6 +673,92 @@ class MultiTaskRolloutCollectionBuffer(AbstractReplayBuffer):
 
         return sampled_rollouts
 
+    def sample(
+        self, batch_size: int, seq_len: int = 3
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Sample sequences of consecutive transitions from stored rollouts.
+
+        Samples random sequences of length seq_len from the buffer, where each
+        sequence preserves temporal ordering. This is useful for recurrent models
+        or temporal learning.
+
+        Args:
+            batch_size: Number of sequences to sample
+            seq_len: Length of each sequence (default: 5)
+
+        Returns:
+            Tuple of (observations, actions, next_observations, dones, rewards)
+            Each with shape (seq_len, batch_size, feature_dim)
+        """
+        if len(self.rollouts) == 0:
+            raise ValueError("Cannot sample from empty buffer")
+
+        # Storage for sampled sequences
+        sampled_obs = []
+        sampled_actions = []
+        sampled_next_obs = []
+        sampled_dones = []
+        sampled_rewards = []
+
+        num_rollouts = len(self.rollouts)
+        samples_collected = 0
+
+        # Sample until we have enough sequences
+        while samples_collected < batch_size:
+            # Randomly select a rollout
+            rollout_idx = self._rng.integers(0, num_rollouts)
+            rollout = self.rollouts[rollout_idx]
+            rollout_len = rollout.observations.shape[0]
+
+            # Check if rollout is long enough for a sequence
+            if rollout_len < seq_len + 1:  # +1 for next_obs
+                continue
+
+            # Randomly select a task
+            task_idx = self._rng.integers(0, self.num_tasks)
+
+            # Randomly select starting position (ensure we have seq_len + 1 steps)
+            max_start = rollout_len - seq_len
+            start_idx = self._rng.integers(0, max_start)
+
+            # Extract sequence
+            obs_seq = rollout.observations[start_idx:start_idx + seq_len, task_idx]
+            action_seq = rollout.actions[start_idx:start_idx + seq_len, task_idx]
+            reward_seq = rollout.rewards[start_idx:start_idx + seq_len, task_idx]
+            done_seq = rollout.dones[start_idx:start_idx + seq_len, task_idx]
+
+            # For next_obs, shift by 1 timestep
+            next_obs_seq = rollout.observations[start_idx + 1:start_idx + seq_len + 1, task_idx]
+
+            sampled_obs.append(obs_seq)
+            sampled_actions.append(action_seq)
+            sampled_next_obs.append(next_obs_seq)
+            sampled_rewards.append(reward_seq)
+            sampled_dones.append(done_seq)
+
+            samples_collected += 1
+
+        # Stack sequences: (batch_size, seq_len, feature_dim) -> (seq_len, batch_size, feature_dim)
+        obs_batch = np.stack(sampled_obs, axis=0).swapaxes(0, 1)  # (seq_len, batch_size, obs_dim)
+        actions_batch = np.stack(sampled_actions, axis=0).swapaxes(0, 1)  # (seq_len, batch_size, action_dim)
+        next_obs_batch = np.stack(sampled_next_obs, axis=0).swapaxes(0, 1)  # (seq_len, batch_size, obs_dim)
+        dones_batch = np.stack(sampled_dones, axis=0).swapaxes(0, 1)  # (seq_len, batch_size, 1)
+        rewards_batch = np.stack(sampled_rewards, axis=0).swapaxes(0, 1)  # (seq_len, batch_size, 1)
+
+        res = [
+            (
+                obs_batch[i].astype(np.float32),
+                actions_batch[i].astype(np.float32),
+                next_obs_batch[i].astype(np.float32),
+                dones_batch[i].astype(np.float32),
+                rewards_batch[i].astype(np.float32),
+            ) for i in range(len(obs_batch))
+        ]
+        res = [
+            ReplayBufferSamples(*batch) for batch in res 
+        ]
+        return res 
+    
     def get_statistics(self) -> dict[str, float]:
         """Get statistics about stored rollouts for monitoring.
 

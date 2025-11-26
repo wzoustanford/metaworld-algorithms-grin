@@ -260,115 +260,6 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
 
         return jax.tree.map(reconstruct_leaf, split_data)
 
-    def _compute_targets(
-        self, 
-        data: ReplayBufferSamples, 
-        alpha_val: Array, 
-        key: PRNGKeyArray
-    ) -> Array:
-        """Helper to compute target Q-values. Handles the split/non-split logic via vmap."""
-        
-        # Define single-sample/batch logic
-        def get_q_target(p_actor, p_critic, obs, next_obs, r, d):
-            # 1. Sample Next Action
-            next_dist = self.actor.apply_fn(p_actor, next_obs)
-            next_action, next_log_prob = next_dist.sample_and_log_prob(seed=key)
-            
-            # 2. Get Target Q
-            # Note: We assume target_params has same structure as params
-            target_q = self.critic.apply_fn(p_critic, next_obs, next_action)
-            
-            # 3. Soft Q Calc
-            min_q = jnp.min(target_q, axis=0) - alpha_val * next_log_prob.reshape(-1, 1)
-            return jax.lax.stop_gradient(r + (1 - d) * self.gamma * min_q)
-
-        if self.split_critic_losses:
-            # Vectorize over the 'task' dimension implicit in the batch or params
-            # Assuming data is split by task if split_losses is True
-            return jax.vmap(get_q_target, in_axes=(None, None, 0, 0, 0, 0))(
-                self.actor.params, self.critic.target_params, 
-                data.observations, data.next_observations, data.rewards, data.dones
-            )
-        else:
-            return get_q_target(
-                self.actor.params, self.critic.target_params,
-                data.observations, data.next_observations, data.rewards, data.dones
-            )
-
-    def _critic_loss_fn(
-        self,
-        params: dict,  # Expects {'critic': ..., 'lstm': ...}
-        obs: Array,
-        actions: Array,
-        target_q: Array,
-        previous_features: Array | None,
-        task_weights: Array | None,
-        lstm_h: Array,
-        lstm_c: Array
-    ):
-        """Pure loss function. No side effects. Returns loss + aux tuple."""
-        critic_params = params['critic']
-        lstm_params = params.get('lstm', None)
-
-        # --- 1. LSTM Mask Generation ---
-        # We handle the 'Step 0' logic (previous_features=None) cleanly
-        has_lstm = lstm_params is not None
-        
-        def apply_lstm_mask(_prev, _h, _c):
-            return self.lstm.apply_fn(lstm_params, _prev, _h, _c)
-
-        def default_mask(_bs: int, _h: Array, _c: Array) -> tuple[Array, Array, Array]:
-            """Generates an all-ones mask and returns the input h/c states unchanged."""
-            # Get MOORE width from LSTM output_size
-            width = self.lstm.params['params']['W_out'].shape[1]
-            mask = jnp.ones((_bs, width))
-            # FIX: Return the input states (_h, _c) as placeholders for the next step
-            return mask, _h, _c
-        
-        # Use functional conditions if we are inside JIT, 
-        # but since 'previous_features is None' is a static trace-time property in the scan loop,
-        # Python if is actually correct and faster here.
-        if has_lstm and previous_features is not None:
-            mask, h_new, c_new = apply_lstm_mask(previous_features, lstm_h, lstm_c)
-        elif has_lstm:
-             # First step or no features yet
-            batch_size = obs.shape[0]
-            
-            # FIX: Pass lstm_h and lstm_c to default_mask
-            mask, h_new, c_new = default_mask(batch_size, lstm_h, lstm_c)
-        else:
-            # No LSTM at all
-            mask, h_new, c_new = None, None, None
-        
-        # --- 2. Critic Forward ---
-        # We always pass mask. If mask is None (No LSTM), the network should handle it 
-        # (or we check has_lstm). Assuming MOORENetwork handles optional mask or we conditionally pass it.
-        if has_lstm:
-            q_pred, updated_vars = self.critic.apply_fn(
-                critic_params, obs, actions, 
-                mask, True, mutable=['intermediates']
-            )
-            # Extract features for next step
-            # Shape: (num_critics, batch, width) -> Take [0]
-            curr_features = updated_vars['intermediates']['VmapQValueFunction_0']['MOORENetwork_0']['or'][0]
-        else:
-            q_pred = self.critic.apply_fn(critic_params, obs, actions)
-            curr_features = None
-
-        # --- 3. Loss Calculation ---
-        # Handle Max Q Clipping
-        if self.max_q_value is not None:
-            q_pred = jnp.clip(q_pred, -self.max_q_value, self.max_q_value)
-
-        # MSE
-        diff = (q_pred - target_q) ** 2
-        
-        # Apply weights (Use 1.0 default to avoid if/else)
-        weights = task_weights if task_weights is not None else 1.0
-        loss = (weights * diff).mean()
-
-        return loss, (q_pred.mean(), h_new, c_new, curr_features)
-
     def update_critic(
         self,
         data: ReplayBufferSamples,
@@ -376,91 +267,275 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
         task_weights: Float[Array, "*batch 1"] | None = None,
         previous_features: Float[Array, "batch feature_dim"] | None = None,
     ) -> tuple[Self, LogDict, Float[Array, "batch feature_dim"] | None]:
-        
-        # 1. Setup Keys & Targets
-        key, new_key = jax.random.split(self.key)
-        target_q_values = self._compute_targets(data, alpha_val, key)
+        key, critic_loss_key = jax.random.split(self.key)
 
-        # 2. Prepare Parameters
-        # Always use the combined dictionary structure. 
-        # Even if LSTM is missing, 'lstm': None is safer than changing structure.
-        combined_params = {'critic': self.critic.params}
-        if hasattr(self, 'lstm') and self.lstm is not None:
-            combined_params['lstm'] = self.lstm.params
-
-        # 3. Define Gradient Function
-        # We bind the 'static' arguments (data, targets) so the grad function only sees params
-        def loss_wrapper(p):
-            return self._critic_loss_fn(
-                p, data.observations, data.actions, target_q_values,
-                previous_features, task_weights, self.lstm_h, self.lstm_c
-            )
-
-        # 4. Compute Gradients
+        # Sample a'
         if self.split_critic_losses:
-            # vmap the gradient function over the task dimension
-            # We assume data is already split/shaped correctly for vmap if this flag is set
-            grad_fn = jax.vmap(jax.value_and_grad(loss_wrapper, has_aux=True))
-            (loss_val, aux), grads = grad_fn(combined_params)
-            
-            # Flatten grads for metrics (taking mean across tasks)
-            # This handles the 'dict' structure of grads automatically
-            flat_grads, _ = flatten_util.ravel_pytree(
-                jax.tree.map(lambda x: x.mean(axis=0), grads['critic'])
+            next_actions, next_action_log_probs = jax.vmap(
+                lambda x: self.actor.apply_fn(self.actor.params, x).sample_and_log_prob(
+                    seed=critic_loss_key
+                )
+            )(data.observations)
+            q_values = jax.vmap(self.critic.apply_fn, in_axes=(None, 0, 0))(
+                self.critic.target_params, data.next_observations, next_actions
             )
         else:
-            grad_fn = jax.value_and_grad(loss_wrapper, has_aux=True)
-            (loss_val, aux), grads = grad_fn(combined_params)
-            flat_grads, _ = flatten_util.ravel_pytree(grads['critic'])
+            next_actions, next_action_log_probs = self.actor.apply_fn(
+                self.actor.params, data.next_observations
+            ).sample_and_log_prob(seed=critic_loss_key)
+            q_values = self.critic.apply_fn(
+                self.critic.target_params, data.next_observations, next_actions
+            )
 
-        # 5. Extract Auxiliary Outputs
-        qf_mean, h_new, c_new, intermediate_features = aux
-        
-        # 6. Apply Updates
-        # -- Critic --
-        # Note: If split_losses, loss_val is a vector.
-        critic_grads = grads['critic']
-        new_critic = self.critic.apply_gradients(
+        def critic_loss(
+            combined_params: dict | FrozenDict,
+            _data: ReplayBufferSamples,
+            _q_values: Float[Array, "#batch 1"],
+            _alpha_val: Float[Array, "#batch 1"],
+            _next_action_log_probs: Float[Array, " #batch"],
+            _previous_features: Float[Array, "batch feature_dim"] | None,  # NEW: Pass previous features explicitly
+            _task_weights: Float[Array, "#batch 1"] | None = None,
+        ) -> tuple[Float[Array, ""], tuple]:
+            """Compute critic loss with optional LSTM masking.
+
+            DESIGN: Accepts combined parameters dict for joint critic+LSTM optimization
+            RETURN: (loss, (q_pred_mean, h_new, c_new, intermediate_features)) - includes LSTM states in auxiliary
+
+            Args:
+                combined_params: Either {'critic': params, 'lstm': params} or just critic params
+                _data: Batch of transitions
+                _q_values: Target Q-values from target network
+                _alpha_val: Temperature parameter values
+                _next_action_log_probs: Log probabilities of next actions
+                _previous_features: Previous timestep's features for LSTM input (None on first step)
+                _task_weights: Optional task-specific weights
+
+            Returns:
+                (loss, auxiliary) where auxiliary = (q_pred_mean, h_new, c_new, intermediate_features)
+            """
+            # Handle both combined and single params (backward compatibility)
+            # DESIGN: If params is dict with 'critic' key, extract critic and LSTM params
+            # Otherwise, assume it's just critic params (no LSTM)
+            if isinstance(combined_params, dict) and 'critic' in combined_params:
+                critic_params = combined_params['critic']
+                lstm_params = combined_params.get('lstm', None)
+            else:
+                critic_params = combined_params
+                lstm_params = None
+
+            # next_action_log_probs is (B,) shaped because of the sum(axis=1), while Q values are (B, 1)
+            min_qf_next_target = jnp.min(
+                _q_values, axis=0
+            ) - _alpha_val * _next_action_log_probs.reshape(-1, 1)
+
+            next_q_value = jax.lax.stop_gradient(
+                _data.rewards + (1 - _data.dones) * self.gamma * min_qf_next_target
+            )
+
+            # Forward pass with or without LSTM
+            if lstm_params is not None and hasattr(self, 'lstm'):
+                # ===== FIRST STEP HANDLING =====
+                # DESIGN: On first step, _previous_features is None - use all-ones mask
+                # This allows the network to perform a normal forward pass and populate features
+                # Subsequent steps will use LSTM-generated masks based on previous features
+                if _previous_features is None:
+                    # First step: use all-ones mask (no modulation)
+                    # Infer batch size from observations
+                    batch_size = _data.observations.shape[0]
+                    # Get MOORE width from LSTM output_size
+                    moore_width = self.lstm.params['params']['W_out'].shape[1]
+                    mask = jnp.ones((batch_size, moore_width))
+                    h_new, c_new = None, None
+                else:
+                    # ===== LSTM TEMPORAL PROCESSING =====
+                    # DESIGN: LSTM receives previous network features and produces mask
+                    # INPUT: _previous_features = previous timestep's masked features
+                    # STATE: self.lstm_h, self.lstm_c = current LSTM states (updated each step)
+                    # OUTPUT: mask for current timestep's features
+                    mask, h_new, c_new = self.lstm.apply_fn(
+                        lstm_params,
+                        _previous_features,  # Previous network intermediate state (passed as arg)
+                        self.lstm_h,         # Current hidden state from class attribute
+                        self.lstm_c          # Current cell state from class attribute
+                    )
+
+                # ===== CRITIC FORWARD PASS WITH MASKING =====
+                # CRITICAL: mutable=['intermediates'] required to return updated_vars
+                # CRITICAL: store=True tells MOORENetwork to save features via self.variable()
+                # NOTE: critic_params already has {'params': ...} structure from TrainState
+                # NOTE: Pass mask and store as kwargs to avoid vmap issues
+                q_pred, updated_vars = self.critic.apply_fn(
+                    critic_params,               # Already has {'params': ...} structure
+                    _data.observations,
+                    _data.actions,
+                    mask,                   # LSTM-generated mask (or all-ones on first step) - pass as kwarg
+                    True,                   # Tell MOORENetwork to store intermediates
+                    mutable=['intermediates'],   # Capture modified collections
+                )
+
+                # ===== EXTRACT MASKED FEATURES FOR NEXT TIMESTEP =====
+                # CRITICAL: Cannot append to self.grin_state_vars here because we're inside jax.grad()
+                # JAX doesn't allow side effects (mutating Python state) inside traced functions
+                # Instead, return the features as auxiliary output and append outside
+                # STRUCTURE: updated_vars['intermediates']['VmapQValueFunction_0']['MOORENetwork_0']['or']
+                # Shape: (num_critics, batch, width) - we'll use first critic's features
+                intermediate_features = updated_vars['intermediates']['VmapQValueFunction_0']['MOORENetwork_0']['or'][0]
+            else:
+                # ===== NO LSTM PATH (backward compatibility) =====
+                # Standard critic forward pass without masking or temporal processing
+                q_pred = self.critic.apply_fn(
+                    critic_params,
+                    _data.observations,
+                    _data.actions
+                )
+                h_new, c_new = None, None
+                intermediate_features = None
+
+            if self.max_q_value is not None:
+                # HACK: Clipping Q values to approximate theoretical maximum for Metaworld
+                next_q_value = jnp.clip(
+                    next_q_value, -self.max_q_value, self.max_q_value
+                )
+                q_pred = jnp.clip(q_pred, -self.max_q_value, self.max_q_value)
+
+            if _task_weights is not None:
+                loss = (_task_weights * (q_pred - next_q_value) ** 2).mean()
+            else:
+                loss = ((q_pred - next_q_value) ** 2).mean()
+
+            # Return loss and auxiliary (includes new LSTM states and intermediate features)
+            # auxiliary = (q_pred_mean, h_new, c_new, intermediate_features)
+            return loss, (q_pred.mean(), h_new, c_new, intermediate_features)
+
+        # ===== COMBINE PARAMETERS FOR JOINT OPTIMIZATION =====
+        # DESIGN: Create a single pytree containing both critic and LSTM parameters
+        # JAX's value_and_grad will compute gradients for all params in this structure
+        # BENEFIT: Single backward pass computes gradients for both networks
+        if hasattr(self, 'lstm'):
+            combined_params = {
+                'critic': self.critic.params,  # Critic network parameters
+                'lstm': self.lstm.params       # LSTM network parameters
+            }
+        else:
+            # Backward compatibility: if no LSTM, just use critic params
+            combined_params = self.critic.params
+
+        if self.split_critic_losses:
+            # ===== JOINT GRADIENT COMPUTATION (per-task split) =====
+            # GRADIENT COMPUTATION: jax.value_and_grad differentiates w.r.t. first arg
+            # has_aux=True: loss function returns (loss, auxiliary_data)
+            # vmap: vectorize over tasks for per-task loss computation
+            (critic_loss_value, aux), combined_grads = jax.vmap(
+                jax.value_and_grad(critic_loss, has_aux=True),
+                in_axes=(None, 0, 0, 0, 0, None, 0),  # previous_features not vmapped (broadcast to all tasks)
+                out_axes=0,
+            )(
+                combined_params,  # Gradients computed for this pytree
+                data,
+                q_values,
+                alpha_val,
+                next_action_log_probs,
+                previous_features,  # NEW: Pass previous features
+                task_weights,
+            )
+
+            # ===== EXTRACT AUXILIARY OUTPUTS =====
+            # aux is tuple: (q_pred.mean(), h_new, c_new)
+            qf_values = aux[0]  # Q-value predictions (for logging)
+            h_new = aux[1]      # New LSTM hidden state
+            c_new = aux[2]      # New LSTM cell state
+
+            # ===== UPDATE LSTM STATES FOR NEXT TIMESTEP =====
+            # CRITICAL: Store updated states as class attributes
+            # These will be used in the next timestep's critic_loss call
+            # TEMPORAL CONTINUITY: h_new/c_new from timestep t become inputs for t+1
+            if h_new is not None:
+                self = self.replace(lstm_h=h_new)
+            if c_new is not None:
+                self = self.replace(lstm_c=c_new)
+
+            # ===== EXTRACT GRADIENTS FROM COMBINED STRUCTURE =====
+            # combined_grads has same structure as combined_params:
+            # If LSTM: {'critic': critic_grads, 'lstm': lstm_grads}
+            # If no LSTM: just critic_grads
+            if isinstance(combined_grads, dict):
+                critic_grads = combined_grads['critic']
+            else:
+                critic_grads = combined_grads
+            flat_grads, _ = flatten_util.ravel_pytree(
+                jax.tree.map(lambda x: x.mean(axis=0), critic_grads)
+            )
+        else:
+            (critic_loss_value, aux), combined_grads = jax.value_and_grad(
+                critic_loss, has_aux=True
+            )(
+                combined_params,
+                data,
+                q_values,
+                alpha_val,
+                next_action_log_probs,
+                previous_features,  # NEW: Pass previous features
+                task_weights,
+            )
+            # Extract auxiliary outputs
+            qf_values = aux[0]
+            h_new = aux[1]
+            c_new = aux[2]
+            intermediate_features = aux[3]
+
+            # Update LSTM states for next timestep
+            if h_new is not None:
+                self = self.replace(lstm_h=h_new)
+            if c_new is not None:
+                self = self.replace(lstm_c=c_new)
+
+            # NOTE: Don't append here - still inside JIT boundary
+            # Will return intermediate_features and append outside JIT
+
+            # Handle gradients
+            if isinstance(combined_grads, dict):
+                critic_grads = combined_grads['critic']
+            else:
+                critic_grads = combined_grads
+            flat_grads, _ = flatten_util.ravel_pytree(critic_grads)
+
+        key, optimizer_key = jax.random.split(key)
+
+        # Apply critic gradients
+        critic = self.critic.apply_gradients(
             grads=critic_grads,
-            optimizer_extra_args={"task_losses": loss_val, "key": key}
+            optimizer_extra_args={
+                "task_losses": critic_loss_value,
+                "key": optimizer_key,
+            },
         )
-        # Soft update targets
-        new_critic = new_critic.replace(
+        critic = critic.replace(
             target_params=optax.incremental_update(
-                new_critic.params, new_critic.target_params, self.tau
+                critic.params,
+                critic.target_params,  # pyright: ignore [reportArgumentType]
+                self.tau,
             )
         )
 
-        # -- LSTM --
-        new_lstm = self.lstm
-        if 'lstm' in grads and grads['lstm'] is not None:
-            new_lstm = self.lstm.apply_gradients(
-                grads=grads['lstm'],
-                optimizer_extra_args={"task_losses": loss_val, "key": key}
+        # Apply LSTM gradients (if LSTM exists and gradients were computed)
+        if hasattr(self, 'lstm') and isinstance(combined_grads, dict) and 'lstm' in combined_grads:
+            lstm_grads = combined_grads['lstm']
+            lstm = self.lstm.apply_gradients(
+                grads=lstm_grads,
+                optimizer_extra_args={
+                    "task_losses": critic_loss_value,
+                    "key": optimizer_key,
+                }
             )
+            self=self.replace(lstm=lstm)
+        flat_params_crit, _ = flatten_util.ravel_pytree(critic.params)
 
-        # 7. Update Self (Functional State Update)
-        # Create new self, updating LSTM states if they exist
-        new_self = self.replace(
-            critic=new_critic,
-            lstm=new_lstm,
-            key=new_key,
-            # Update h/c if they were returned (meaning LSTM ran)
-            lstm_h=h_new if h_new is not None else self.lstm_h,
-            lstm_c=c_new if c_new is not None else self.lstm_c
-        )
-
-        # 8. Logs
-        # Handle mean vs vector loss for logging
-        loss_scalar = jnp.mean(loss_val)
-        
-        logs = {
-            "losses/qf_values": jnp.mean(qf_mean),
-            "losses/qf_loss": loss_scalar,
+        return self.replace(critic=critic, key=key), {
+            "losses/qf_values": qf_values.mean(),
+            "losses/qf_loss": critic_loss_value.mean(),
             "metrics/critic_grad_magnitude": jnp.linalg.norm(flat_grads),
-        }
-
-        return new_self, logs, intermediate_features
+            "metrics/critic_params_norm": jnp.linalg.norm(flat_params_crit),
+        }, intermediate_features
 
     def update_actor(
         self,
@@ -775,10 +850,9 @@ class MTSACSequential(MTSAC):
                 self.grin_state_vars.append(intermediate_features)
 
         return self, logs
-
+    
     @override
     def update(self, data: list[ReplayBufferSamples]) -> tuple[Self, LogDict]:
-        print(f"sequence length: {len(data)}")
         # 1. PREPARE DATA: Stack the list of samples into a single PyTree with time dimension
         # Input: list of T objects, each with shape (B, D)
         # Output: One object with shape (T, B, D)
@@ -814,7 +888,6 @@ class MTSACSequential(MTSAC):
         # We slice the data to get steps 1 through T
         scan_data = jax.tree.map(lambda x: x[1:], stacked_data)
         
-        @jax.checkpoint
         def scan_step(carry, x):
             # Unpack carry
             step_self, prev_features = carry

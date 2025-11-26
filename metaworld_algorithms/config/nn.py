@@ -6,7 +6,7 @@ from .utils import Activation, CellType, Initializer
 
 @dataclass(frozen=True, kw_only=True)
 class NeuralNetworkConfig:
-    width: int = 400
+    width: int = 600
     """The number of neurons in the hidden layers."""
 
     depth: int = 3
@@ -152,3 +152,21 @@ class MOOREConfig(NeuralNetworkConfig):
     num_experts: int = 6
     """The number of orthogonal experts."""
     # Original values are 4 for MT10 and 6 for MT50
+
+
+@dataclass(frozen=True, kw_only=True)
+class LSTMConfig:
+    """Configuration for GatedRecurrentMask LSTM used with MOORE networks.
+
+    The LSTM processes temporal activations from the critic network and generates
+    masks to modulate network features for improved temporal learning.
+    """
+
+    hidden_size: int = 32
+    """The dimension of the LSTM hidden state (h) and cell state (c)."""
+
+    output_size: int = 600
+    """The dimension of the output mask. Should match MOORE network width."""
+    
+    optimizer: OptimizerConfig = OptimizerConfig(lr=3e-4)
+    """The optimizer to use for LSTM parameters (h0, c0, gates, output projection)."""

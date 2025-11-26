@@ -632,11 +632,21 @@ class OffPolicyAlgorithm(
                         },
                         step=total_steps,
                     )
-
+            
             if global_step > config.warmstart_steps:
                 # Update the agent with data
+                print(f"global_step:{global_step};  total_step:{total_steps}")
+                s_time = time.time()
                 data = replay_buffer.sample(config.batch_size)
+                e_time = time.time()
+                elapsed_time = e_time - s_time
+                print(f"sample batch: {elapsed_time:.2f}")
+
+                s_time = time.time()
                 self, logs = self.update(data)
+                e_time = time.time()
+                elapsed_time = e_time - s_time
+                print(f"update batch: {elapsed_time:.2f}")
 
                 # Logging
                 if global_step % 100 == 0:
