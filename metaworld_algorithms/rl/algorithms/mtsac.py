@@ -350,11 +350,13 @@ class MTSAC(OffPolicyAlgorithm[MTSACConfig]):
             )
             # Extract features for next step
             # Shape: (num_critics, batch, width) -> Take [0]
-            curr_features = updated_vars['intermediates']['VmapQValueFunction_0']['MOORENetwork_0']['or'][0]
+            curr_features = jax.lax.stop_gradient(updated_vars['intermediates']['VmapQValueFunction_0']['MOORENetwork_0']['or'][0])
+            h_new = jax.lax.stop_gradient(h_new)
+            c_new = jax.lax.stop_gradient(c_new)
         else:
             q_pred = self.critic.apply_fn(critic_params, obs, actions)
             curr_features = None
-
+        
         # --- 3. Loss Calculation ---
         # Handle Max Q Clipping
         if self.max_q_value is not None:
@@ -657,7 +659,7 @@ class MTSACSequential(MTSAC):
     # DESIGN: Store LSTM state and temporal information as class attributes
     # This enables temporal continuity across timesteps during training
 
-    grin_state_vars: list = struct.field(default_factory=list)  # Stores network intermediate states (masked features)
+    grin_state_vars: Array | None = None #list = struct.field(default_factory=list)  # Stores network intermediate states (masked features)
                                                                  # USAGE: grin_state_vars[-1] fed to LSTM at each timestep
                                                                  # GROWS: Appends new masked features after each forward pass
 
@@ -746,11 +748,12 @@ class MTSACSequential(MTSAC):
     ) -> MultiTaskRolloutCollectionBuffer:
         """Spawn sequential rollout collection buffer instead of standard replay buffer."""
         return MultiTaskRolloutCollectionBuffer(
-            total_capacity=self.rollout_capacity,
+            total_capacity=config.buffer_size,
             num_tasks=self.num_tasks,
             env_obs_space=env_config.observation_space,
             env_action_space=env_config.action_space,
             max_rollout_steps=self.max_rollout_steps,
+            seq_len=config.seq_len,
             seed=seed,
         )
     
@@ -763,7 +766,7 @@ class MTSACSequential(MTSAC):
             # CRITICAL: Access Python list here, before calling JIT-compiled function
             # On first step: None (use all-ones mask)
             # On subsequent steps: Last stored features from grin_state_vars
-            previous_features = None if len(self.grin_state_vars) == 0 else self.grin_state_vars[-1]
+            previous_features = None if self.grin_state_vars is None else self.grin_state_vars
 
             # Call JIT-compiled function
             self, logs, intermediate_features = self._update_inner(d, previous_features)
@@ -772,21 +775,25 @@ class MTSACSequential(MTSAC):
             # CRITICAL: Python list mutation happens here, outside @jax.jit
             # This allows proper JIT compilation of _update_inner
             if intermediate_features is not None:
-                self.grin_state_vars.append(intermediate_features)
+                self = self.replace(grin_state_vars=intermediate_features)
 
         return self, logs
 
     @override
-    def update(self, data: list[ReplayBufferSamples]) -> tuple[Self, LogDict]:
-        print(f"sequence length: {len(data)}")
-        # 1. PREPARE DATA: Stack the list of samples into a single PyTree with time dimension
-        # Input: list of T objects, each with shape (B, D)
-        # Output: One object with shape (T, B, D)
-        stacked_data = jax.tree.map(lambda *xs: jnp.stack(xs), *data)
-        
+    def update(self, data: ReplayBufferSamples) -> tuple[Self, LogDict]:
+        # NEW: data is already a single ReplayBufferSamples with shape (seq_len, batch, dim)
+        # No need to stack - buffer.sample() returns the right format
+        stacked_data = data
+
         # Determine dimensions
         total_steps = stacked_data.observations.shape[0]
         batch_size = stacked_data.observations.shape[1]
+        print(f"sequence length: {total_steps}")
+
+        # OLD CODE (backup): When buffer.sample() returned list[ReplayBufferSamples]
+        # stacked_data = jax.tree.map(lambda *xs: jnp.stack(xs), *data)
+        # total_steps = stacked_data.observations.shape[0]
+        # batch_size = stacked_data.observations.shape[1]
         
         # 2. INITIALIZE: Reset LSTM states (h0, c0) for the new batch
         current_self = self.reset_lstm_h_c_states(batch_size)
@@ -803,15 +810,8 @@ class MTSACSequential(MTSAC):
         
         # If we only have one step, return early
         if total_steps == 1:
-            # Handle grin_state_vars for consistency
-            if features_0 is not None:
-                # We convert to a list here to match your original API expectation
-                # though keeping it as a JAX array is usually better for performance.
-                current_self.grin_state_vars.append(features_0)
             return current_self, logs_0
 
-        # 4. STEP 1 to T: Use jax.lax.scan for the rest
-        # We slice the data to get steps 1 through T
         scan_data = jax.tree.map(lambda x: x[1:], stacked_data)
         
         @jax.checkpoint
@@ -839,20 +839,6 @@ class MTSACSequential(MTSAC):
             carry_init, 
             scan_data
         )
-
-        # 5. AGGREGATE RESULTS
-        # Combine Step 0 features with Scan features (Steps 1..T)
-        # features_0 shape: (Batch, Dim) -> expand to (1, Batch, Dim)
-        # scan_features_history shape: (T-1, Batch, Dim)
-        if features_0 is not None:
-            features_0_expanded = jnp.expand_dims(features_0, 0)
-            all_features = jnp.concatenate([features_0_expanded, scan_features_history], axis=0)
-            
-            # Update the grin_state_vars with the full history
-            # NOTE: Ideally store this as an array, but if you need a list:
-            # final_self.grin_state_vars.extend([all_features[i] for i in range(total_steps)])
-            # For pure JAX performance, prefer storing the array:
-            final_self.grin_state_vars.append(all_features)
         
         # Combine logs
         # We need to average the logs from Step 0 and the logs from Scan

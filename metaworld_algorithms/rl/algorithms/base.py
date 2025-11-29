@@ -588,7 +588,8 @@ class OffPolicyAlgorithm(
 
         for global_step in range(start_step, config.total_steps // envs.num_envs):
             total_steps = global_step * envs.num_envs
-
+            if global_step > config.warmstart_steps:
+                total_steps = config.warmstart_steps * envs.num_envs + (global_step - config.warmstart_steps) * config.seq_len * envs.num_envs 
             if global_step < config.warmstart_steps:
                 actions = envs.action_space.sample()
             else:
@@ -637,7 +638,7 @@ class OffPolicyAlgorithm(
                 # Update the agent with data
                 print(f"global_step:{global_step};  total_step:{total_steps}")
                 s_time = time.time()
-                data = replay_buffer.sample(config.batch_size)
+                data = replay_buffer.sample(config.batch_size, config.seq_len)
                 e_time = time.time()
                 elapsed_time = e_time - s_time
                 print(f"sample batch: {elapsed_time:.2f}")
@@ -660,7 +661,7 @@ class OffPolicyAlgorithm(
                 # Evaluation
                 if (
                     config.evaluation_frequency > 0
-                    and episodes_ended % config.evaluation_frequency == 0
+                    and episodes_ended //config.seq_len % config.evaluation_frequency == 0
                     and done.any()
                     and global_step > 0
                 ):

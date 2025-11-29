@@ -1,4 +1,4 @@
-import abc
+import abc, pdb
 from collections import deque
 from typing import override
 
@@ -380,21 +380,33 @@ class MultiTaskReplayBuffer(AbstractReplayBuffer):
 
 
 class MultiTaskRolloutCollectionBuffer(AbstractReplayBuffer):
-    """Collection buffer storing multiple complete rollouts for off-policy learning.
+    """Collection buffer storing sequences in fixed-size arrays for off-policy learning.
 
-    Unlike MultiTaskReplayBuffer (stores individual transitions) or MultiTaskRolloutBuffer
-    (stores one rollout at a time for on-policy algorithms), this stores MANY complete
-    rollouts in a circular buffer, preserving sequential structure within each rollout.
+    Unlike the old deque-based approach, this stores sequences in a fixed-size ndarray
+    with dimensions [seq_len, buffer_capacity, feature_dim]. When rollouts are longer
+    than seq_len, they are stored as sliding windows (stride=1).
 
-    TODO: Current capacity (2000 rollouts) assumes ~500 steps/rollout on average.
-          Need to verify actual average rollout length from data and adjust capacity
-          accordingly to match ~1M transition equivalent storage.
+    DESIGN:
+    - Fixed-size ndarray: stores seq_len+1 observations to get proper next_obs
+    - Actions/rewards/dones: seq_len timesteps (transitions)
+    - Observations: seq_len+1 timesteps (states) - obs[0:seq_len] and next_obs = obs[1:seq_len+1]
+    - Circular buffer: overwrites oldest sequences when full
+    - Sliding windows: rollout[0:seq_len+1], rollout[1:seq_len+2], etc.
+    - Total storage respects buffer_size limit from OffPolicyTrainingConfig
     """
 
-    rollouts: deque[Rollout]
-    capacity: int
+    # Fixed-size storage arrays
+    sequences_obs: np.ndarray  # [buffer_capacity, seq_len, num_tasks, obs_dim]
+    sequences_next_obs: np.ndarray  # [buffer_capacity, seq_len, num_tasks, obs_dim]
+    sequences_actions: np.ndarray  # [buffer_capacity, seq_len, num_tasks, action_dim]
+    sequences_rewards: np.ndarray  # [buffer_capacity, seq_len, num_tasks, 1]
+    sequences_dones: np.ndarray  # [buffer_capacity, seq_len, num_tasks, 1]
+
+    buffer_capacity: int  # Max number of sequences to store
+    seq_len: int  # Fixed sequence length
     num_tasks: int
-    pos: int
+    pos: int  # Current write position (circular)
+    full: bool  # Whether buffer has wrapped around
 
     def __init__(
         self,
@@ -403,24 +415,30 @@ class MultiTaskRolloutCollectionBuffer(AbstractReplayBuffer):
         env_obs_space: gym.Space,
         env_action_space: gym.Space,
         max_rollout_steps: int = 500,
+        seq_len: int = 100,
         seed: int | None = None,
     ) -> None:
         """Initialize the rollout collection buffer.
 
         Args:
-            total_capacity: Maximum number of rollouts to store (e.g., 2000)
+            total_capacity: Maximum total transitions to store (buffer_size from config, e.g., 5e6)
             num_tasks: Number of tasks in the multi-task environment
             env_obs_space: Observation space from the environment
             env_action_space: Action space from the environment
             max_rollout_steps: Maximum timesteps per rollout (default: 500)
+            seq_len: Fixed sequence length for stored sequences (from OffPolicyTrainingConfig)
             seed: Random seed for sampling
         """
-        self.capacity = total_capacity
+        self.seq_len = seq_len
         self.num_tasks = num_tasks
         self.max_rollout_steps = max_rollout_steps
         self._rng = np.random.default_rng(seed)
         self._obs_shape = np.array(env_obs_space.shape).prod()
         self._action_shape = np.array(env_action_space.shape).prod()
+
+        # Calculate buffer capacity: total_capacity / (seq_len * num_tasks)
+        # This ensures total storage <= buffer_size
+        self.buffer_capacity = total_capacity // (seq_len * num_tasks)
         self.full = False
 
         # Internal buffer for building current rollout
@@ -437,30 +455,44 @@ class MultiTaskRolloutCollectionBuffer(AbstractReplayBuffer):
     @override
     def reset(self) -> None:
         """Reinitialize the buffer."""
-        self.rollouts = deque(maxlen=self.capacity)
+        # Initialize fixed-size arrays - separate obs and next_obs for fast sampling
+        self.sequences_obs = np.zeros(
+            (self.buffer_capacity, self.seq_len, self.num_tasks, self._obs_shape),
+            dtype=np.float32
+        )
+        self.sequences_next_obs = np.zeros(
+            (self.buffer_capacity, self.seq_len, self.num_tasks, self._obs_shape),
+            dtype=np.float32
+        )
+        self.sequences_actions = np.zeros(
+            (self.buffer_capacity, self.seq_len, self.num_tasks, self._action_shape),
+            dtype=np.float32
+        )
+        self.sequences_rewards = np.zeros(
+            (self.buffer_capacity, self.seq_len, self.num_tasks, 1),
+            dtype=np.float32
+        )
+        self.sequences_dones = np.zeros(
+            (self.buffer_capacity, self.seq_len, self.num_tasks, 1),
+            dtype=np.float32
+        )
+
         self.pos = 0
+        self.full = False
         self._current_rollout_buffer.reset()
 
     @override
     def checkpoint(self) -> ReplayBufferCheckpoint:
         """Save buffer state for checkpointing."""
-        # GENERAL PRINCIPLE: StandardSave only accepts numpy arrays + simple Python types (int, bool, float)
-        # Any complex objects (NamedTuples, custom classes, etc.) must be decomposed to raw arrays
-
-        # Decompose Rollout NamedTuples into component arrays
-        # Each rollout is stored as separate arrays for observations, actions, rewards, dones
-        rollout_data = {
-            "rollout_observations": [r.observations for r in self.rollouts],
-            "rollout_actions": [r.actions for r in self.rollouts],
-            "rollout_rewards": [r.rewards for r in self.rollouts],
-            "rollout_dones": [r.dones for r in self.rollouts],
-            "num_rollouts": len(self.rollouts),
-        }
-
+        # DESIGN: All data now stored in fixed-size ndarrays (no NamedTuples to decompose)
         return {
             "data": {
-                # Decomposed rollouts (list of arrays is OK for StandardSave)
-                **rollout_data,
+                # Fixed-size sequence arrays
+                "sequences_obs": self.sequences_obs,
+                "sequences_next_obs": self.sequences_next_obs,
+                "sequences_actions": self.sequences_actions,
+                "sequences_rewards": self.sequences_rewards,
+                "sequences_dones": self.sequences_dones,
                 "pos": int(self.pos),
                 "full": bool(self.full),
                 # Current rollout buffer arrays and position
@@ -483,20 +515,12 @@ class MultiTaskRolloutCollectionBuffer(AbstractReplayBuffer):
         for key in ["data", "rng_state"]:
             assert key in ckpt
 
-        # Reconstruct Rollout NamedTuples from decomposed arrays
-        num_rollouts = ckpt["data"]["num_rollouts"]
-        rollouts_list = []
-        for i in range(num_rollouts):
-            rollout = Rollout(
-                observations=ckpt["data"]["rollout_observations"][i],
-                actions=ckpt["data"]["rollout_actions"][i],
-                rewards=ckpt["data"]["rollout_rewards"][i],
-                dones=ckpt["data"]["rollout_dones"][i],
-            )
-            rollouts_list.append(rollout)
-
-        # Restore main buffer state
-        self.rollouts = deque(rollouts_list, maxlen=self.capacity)
+        # Restore fixed-size sequence arrays
+        self.sequences_obs = ckpt["data"]["sequences_obs"]
+        self.sequences_next_obs = ckpt["data"]["sequences_next_obs"]
+        self.sequences_actions = ckpt["data"]["sequences_actions"]
+        self.sequences_rewards = ckpt["data"]["sequences_rewards"]
+        self.sequences_dones = ckpt["data"]["sequences_dones"]
         self.pos = ckpt["data"]["pos"]
         self.full = ckpt["data"]["full"]
 
@@ -542,35 +566,189 @@ class MultiTaskRolloutCollectionBuffer(AbstractReplayBuffer):
             self._store_current_rollout()
 
     def _store_current_rollout(self) -> None:
-        """Store the current rollout buffer into the collection and reset it."""
+        """Store the current rollout as sliding window sequences into fixed arrays.
+
+        SLIDING WINDOW APPROACH:
+        - Need seq_len+1 observations for seq_len transitions (to get next_obs)
+        - If rollout length <= seq_len: skip (not enough data for proper next_obs)
+        - If rollout length > seq_len: store all possible windows with stride=1
+          Example: rollout_len=102, seq_len=100 -> store windows at positions 0, 1
+                   window[0]: obs[0:100], next_obs[1:101], actions[0:100], rewards[0:100], dones[0:100]
+                   window[1]: obs[1:101], next_obs[2:102], actions[1:101], rewards[1:101], dones[1:101]
+        """
         if self._current_rollout_buffer.pos == 0:
             return
 
-        # Get rollout (only up to current position)
-        rollout = Rollout(
-            observations=self._current_rollout_buffer.observations[: self._current_rollout_buffer.pos],
-            actions=self._current_rollout_buffer.actions[: self._current_rollout_buffer.pos],
-            rewards=self._current_rollout_buffer.rewards[: self._current_rollout_buffer.pos],
-            dones=self._current_rollout_buffer.dones[: self._current_rollout_buffer.pos],
-            log_probs=None,
-            means=None,
-            stds=None,
-            values=None,
-            rnn_states=None,
-        )
+        rollout_len = self._current_rollout_buffer.pos
 
-        # Add to collection (deque automatically handles overflow)
-        self.rollouts.append(rollout)
-        self.pos += 1
+        # Skip if rollout is too short: need seq_len+1 observations for seq_len transitions
+        if rollout_len <= self.seq_len:
+            self._current_rollout_buffer.reset()
+            return
 
-        # Mark as full when we've wrapped around
-        if len(self.rollouts) == self.capacity:
-            self.full = True
+        # Calculate number of sliding windows we can extract
+        # Each window needs seq_len+1 observations
+        num_windows = rollout_len - self.seq_len
+
+        # Extract and store each sliding window
+        for window_idx in range(num_windows):
+            # Extract observations: [window_idx:window_idx+seq_len+1] for seq_len+1 timesteps
+            # This gives us obs[t] for t=0..seq_len, so next_obs[t] = obs[t+1]
+            seq_obs = self._current_rollout_buffer.observations[
+                window_idx:window_idx + self.seq_len
+            ]
+            seq_next_obs = self._current_rollout_buffer.observations[
+                window_idx + 1:window_idx + self.seq_len + 1
+            ]
+
+            # Extract transitions: [window_idx:window_idx+seq_len] for seq_len transitions
+            seq_actions = self._current_rollout_buffer.actions[
+                window_idx:window_idx + self.seq_len
+            ]
+            seq_rewards = self._current_rollout_buffer.rewards[
+                window_idx:window_idx + self.seq_len
+            ]
+            seq_dones = self._current_rollout_buffer.dones[
+                window_idx:window_idx + self.seq_len
+            ]
+
+            # Store in circular buffer at current position
+            self.sequences_obs[self.pos] = seq_obs  # [seq_len, num_tasks, obs_dim]
+            self.sequences_next_obs[self.pos] = seq_next_obs  # [seq_len, num_tasks, obs_dim]
+            self.sequences_actions[self.pos] = seq_actions  # [seq_len, num_tasks, action_dim]
+            self.sequences_rewards[self.pos] = seq_rewards  # [seq_len, num_tasks, 1]
+            self.sequences_dones[self.pos] = seq_dones  # [seq_len, num_tasks, 1]
+
+            # Advance circular buffer position
+            self.pos += 1
+            if self.pos >= self.buffer_capacity:
+                self.full = True
+                self.pos = 0  # Wrap around (circular buffer)
 
         # Reset for next rollout
         self._current_rollout_buffer.reset()
 
-    @override
+    def sample(
+        self, batch_size: int, seq_len: int | None = None
+    ) -> ReplayBufferSamples:
+        """Sample sequences from the fixed-size buffer.
+
+        DESIGN: Samples from pre-stored sequences in the fixed-size buffer.
+        Each sequence has length self.seq_len with proper next_obs from seq_len+1 stored observations.
+        Task information is embedded in the observations (task IDs in last dimensions).
+
+        Args:
+            batch_size: Number of sequences to sample
+            seq_len: Ignored (for backward compatibility). Uses self.seq_len instead.
+
+        Returns:
+            Single ReplayBufferSamples with time dimension:
+            - observations: (seq_len, batch_size, obs_dim)
+            - actions: (seq_len, batch_size, action_dim)
+            - etc.
+        """
+        # Determine valid range for sampling
+        num_available = self.pos if not self.full else self.buffer_capacity
+
+        if num_available == 0:
+            raise ValueError("Cannot sample from empty buffer")
+
+        single_task_batch_size = batch_size // self.num_tasks 
+
+        # Randomly sample sequence indices - simple indexing like ReplayBuffer.sample()
+        # Shape: (batch_size,)
+        seq_indices = self._rng.integers(0, num_available, size=single_task_batch_size)
+
+        mt_batch_size = single_task_batch_size * self.num_tasks
+        #batch = map(lambda x: x, batch)
+        #batch = map(lambda x: x.reshape(self.seq_len, mt_batch_size, *x.shape[3:]), batch)
+        # Do expensive operations ONCE
+        obs_batch = self.sequences_obs[seq_indices].transpose(1, 0, 2, 3).reshape(self.seq_len, mt_batch_size, -1)
+        actions_batch = self.sequences_actions[seq_indices].transpose(1, 0, 2, 3).reshape(self.seq_len, mt_batch_size, -1)
+        next_obs_batch = self.sequences_next_obs[seq_indices].transpose(1, 0, 2, 3).reshape(self.seq_len, mt_batch_size, -1)
+        dones_batch = self.sequences_dones[seq_indices].transpose(1, 0, 2, 3).reshape(self.seq_len, mt_batch_size, -1)
+        rewards_batch = self.sequences_rewards[seq_indices].transpose(1, 0, 2, 3).reshape(self.seq_len, mt_batch_size, -1)
+
+        # Return single ReplayBufferSamples with time dimension (seq_len, batch, dim)
+        # This avoids creating 100 separate Python objects
+        return ReplayBufferSamples(
+            observations=obs_batch,  # (seq_len, mt_batch_size, obs_dim)
+            actions=actions_batch,
+            next_observations=next_obs_batch,
+            dones=dones_batch,
+            rewards=rewards_batch,
+        )
+
+        # OLD CODE (backup): Returns list of 100 objects - slower
+        # return [
+        #     ReplayBufferSamples(
+        #         observations=obs_batch[i].astype(np.float32),
+        #         actions=actions_batch[i].astype(np.float32),
+        #         next_observations=next_obs_batch[i].astype(np.float32),
+        #         dones=dones_batch[i].astype(np.float32),
+        #         rewards=rewards_batch[i].astype(np.float32),
+        #     ) for i in range(self.seq_len)
+        # ]
+
+        """
+        # Extract sequences using simple indexing
+        # sequences_obs shape: [buffer_capacity, seq_len+1, num_tasks, obs_dim]
+        # After indexing: [batch_size, seq_len+1, num_tasks, obs_dim]
+        sampled_obs_all = self.sequences_obs[seq_indices]
+
+        # Split into obs[t] and next_obs[t] = obs[t+1]
+        sampled_obs = sampled_obs_all[:, :-1, :, :]  # [batch_size, seq_len, num_tasks, obs_dim]
+        sampled_next_obs = sampled_obs_all[:, 1:, :, :]  # [batch_size, seq_len, num_tasks, obs_dim]
+
+        # Extract actions/rewards/dones with simple indexing
+        sampled_actions = self.sequences_actions[seq_indices]
+        sampled_rewards = self.sequences_rewards[seq_indices]
+        sampled_dones = self.sequences_dones[seq_indices]
+
+        # Reshape to flatten batch and task dimensions: [batch_size, seq_len, num_tasks, dim] -> [batch_size*num_tasks, seq_len, dim]
+        # Then transpose to [seq_len, batch_size*num_tasks, dim]
+        # Reshape: [batch, seq, tasks, dim] -> [seq, batch*tasks, dim]
+        obs_batch = sampled_obs.reshape(batch_size, self.seq_len, -1).transpose(1, 0, 2)
+        actions_batch = sampled_actions.reshape(batch_size, self.seq_len, -1).transpose(1, 0, 2)
+        next_obs_batch = sampled_next_obs.reshape(batch_size, self.seq_len, -1).transpose(1, 0, 2)
+        dones_batch = sampled_dones.reshape(batch_size, self.seq_len, -1).transpose(1, 0, 2)
+        rewards_batch = sampled_rewards.reshape(batch_size, self.seq_len, -1).transpose(1, 0, 2)
+
+        # Convert to list of ReplayBufferSamples (one per timestep)
+        res = [
+            ReplayBufferSamples(
+                observations=obs_batch[i].astype(np.float32),
+                actions=actions_batch[i].astype(np.float32),
+                next_observations=next_obs_batch[i].astype(np.float32),
+                dones=dones_batch[i].astype(np.float32),
+                rewards=rewards_batch[i].astype(np.float32),
+            ) for i in range(self.seq_len)
+        ]
+
+        return res 
+        """
+    
+    def get_statistics(self) -> dict[str, float]:
+        """Get statistics about stored sequences for monitoring.
+
+        Returns:
+            Dictionary with num_sequences, sequence_length, total_transitions
+        """
+        num_sequences = self.pos if not self.full else self.buffer_capacity
+
+        if num_sequences == 0:
+            return {
+                "num_sequences": 0,
+                "sequence_length": self.seq_len,
+                "total_transitions": 0,
+            }
+
+        return {
+            "num_sequences": num_sequences,
+            "sequence_length": self.seq_len,
+            "total_transitions": num_sequences * self.seq_len * self.num_tasks,
+        }
+
     def sample_no_seq(self, batch_size: int) -> ReplayBufferSamples:
         """Sample random transitions from stored rollouts.
 
@@ -672,118 +850,6 @@ class MultiTaskRolloutCollectionBuffer(AbstractReplayBuffer):
             sampled_rollouts.append(rollout)
 
         return sampled_rollouts
-
-    def sample(
-        self, batch_size: int, seq_len: int = 3
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Sample sequences of consecutive transitions from stored rollouts.
-
-        Samples random sequences of length seq_len from the buffer, where each
-        sequence preserves temporal ordering. This is useful for recurrent models
-        or temporal learning.
-
-        Args:
-            batch_size: Number of sequences to sample
-            seq_len: Length of each sequence (default: 5)
-
-        Returns:
-            Tuple of (observations, actions, next_observations, dones, rewards)
-            Each with shape (seq_len, batch_size, feature_dim)
-        """
-        if len(self.rollouts) == 0:
-            raise ValueError("Cannot sample from empty buffer")
-
-        # Storage for sampled sequences
-        sampled_obs = []
-        sampled_actions = []
-        sampled_next_obs = []
-        sampled_dones = []
-        sampled_rewards = []
-
-        num_rollouts = len(self.rollouts)
-        samples_collected = 0
-
-        # Sample until we have enough sequences
-        while samples_collected < batch_size:
-            # Randomly select a rollout
-            rollout_idx = self._rng.integers(0, num_rollouts)
-            rollout = self.rollouts[rollout_idx]
-            rollout_len = rollout.observations.shape[0]
-
-            # Check if rollout is long enough for a sequence
-            if rollout_len < seq_len + 1:  # +1 for next_obs
-                continue
-
-            # Randomly select a task
-            task_idx = self._rng.integers(0, self.num_tasks)
-
-            # Randomly select starting position (ensure we have seq_len + 1 steps)
-            max_start = rollout_len - seq_len
-            start_idx = self._rng.integers(0, max_start)
-
-            # Extract sequence
-            obs_seq = rollout.observations[start_idx:start_idx + seq_len, task_idx]
-            action_seq = rollout.actions[start_idx:start_idx + seq_len, task_idx]
-            reward_seq = rollout.rewards[start_idx:start_idx + seq_len, task_idx]
-            done_seq = rollout.dones[start_idx:start_idx + seq_len, task_idx]
-
-            # For next_obs, shift by 1 timestep
-            next_obs_seq = rollout.observations[start_idx + 1:start_idx + seq_len + 1, task_idx]
-
-            sampled_obs.append(obs_seq)
-            sampled_actions.append(action_seq)
-            sampled_next_obs.append(next_obs_seq)
-            sampled_rewards.append(reward_seq)
-            sampled_dones.append(done_seq)
-
-            samples_collected += 1
-
-        # Stack sequences: (batch_size, seq_len, feature_dim) -> (seq_len, batch_size, feature_dim)
-        obs_batch = np.stack(sampled_obs, axis=0).swapaxes(0, 1)  # (seq_len, batch_size, obs_dim)
-        actions_batch = np.stack(sampled_actions, axis=0).swapaxes(0, 1)  # (seq_len, batch_size, action_dim)
-        next_obs_batch = np.stack(sampled_next_obs, axis=0).swapaxes(0, 1)  # (seq_len, batch_size, obs_dim)
-        dones_batch = np.stack(sampled_dones, axis=0).swapaxes(0, 1)  # (seq_len, batch_size, 1)
-        rewards_batch = np.stack(sampled_rewards, axis=0).swapaxes(0, 1)  # (seq_len, batch_size, 1)
-
-        res = [
-            (
-                obs_batch[i].astype(np.float32),
-                actions_batch[i].astype(np.float32),
-                next_obs_batch[i].astype(np.float32),
-                dones_batch[i].astype(np.float32),
-                rewards_batch[i].astype(np.float32),
-            ) for i in range(len(obs_batch))
-        ]
-        res = [
-            ReplayBufferSamples(*batch) for batch in res 
-        ]
-        return res 
-    
-    def get_statistics(self) -> dict[str, float]:
-        """Get statistics about stored rollouts for monitoring.
-
-        Returns:
-            Dictionary with num_rollouts, avg/min/max rollout length, total transitions
-        """
-        if len(self.rollouts) == 0:
-            return {
-                "num_rollouts": 0,
-                "avg_rollout_length": 0.0,
-                "min_rollout_length": 0,
-                "max_rollout_length": 0,
-                "total_transitions": 0,
-            }
-
-        lengths = [rollout.observations.shape[0] for rollout in self.rollouts]
-
-        return {
-            "num_rollouts": len(self.rollouts),
-            "avg_rollout_length": float(np.mean(lengths)),
-            "min_rollout_length": int(np.min(lengths)),
-            "max_rollout_length": int(np.max(lengths)),
-            "total_transitions": int(np.sum(lengths)) * self.num_tasks,
-        }
-
 
 class MultiTaskRolloutBuffer:
     num_rollout_steps: int

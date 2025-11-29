@@ -67,8 +67,9 @@ def main() -> None:
         training_config=OffPolicyTrainingConfig(
             warmstart_steps=int(1e3),
             total_steps=int(1e8),
-            buffer_size=int(1e6),  # Not used by MTSACSequential, kept for compatibility
+            buffer_size=int(5e6),  # Not used by MTSACSequential, kept for compatibility
             batch_size=6400,
+            seq_len=200,
         ),
         checkpoint=True,
         resume=args.resume,
