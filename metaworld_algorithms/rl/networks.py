@@ -214,7 +214,7 @@ class QValueFunction(nn.Module):
     config: QValueFunctionConfig
 
     @nn.compact
-    def __call__(self, state: jax.Array, action: jax.Array) -> jax.Array:
+    def __call__(self, state: jax.Array, action: jax.Array, mask: jax.Array | None = None, store: bool = False) -> jax.Array:
         # NOTE: certain NN architectures that make use of task IDs will be looking for them
         # at the last N_TASKS dimensions of their input. So while normally concat(state,action) makes more sense
         # we'll go with (action, state) here
@@ -226,7 +226,7 @@ class QValueFunction(nn.Module):
                 head_dim=1,
                 head_kernel_init=uniform(3e-3),
                 head_bias_init=uniform(3e-3),
-            )(x)
+            )(x, mask=mask, store=store)
         else:
             raise NotImplementedError(
                 "Value prediction as classification is not supported yet."
@@ -252,6 +252,48 @@ class ValueFunction(nn.Module):
                 "Value prediction as classification is not supported yet."
             )
 
+"""
+class Ensemble(nn.Module):
+    net_cls: nn.Module | Callable[..., nn.Module]
+    num: int = 2
+
+    @nn.compact
+    def __call__(self, *args, **kwargs):
+        # vmap doesn't support kwargs, so we need to convert them to positional args
+        # Extract mask and store from kwargs if present
+        mask = kwargs.pop('mask', None)
+        store = kwargs.pop('store', False)
+
+        # Create wrapper that converts mask/store back to kwargs for the underlying network
+        # This works because the wrapper itself doesn't use vmap - it just adapts the interface
+        def wrapped_call(module_instance, *call_args):
+            # module_instance is the actual network instance created by vmap
+            # call_args are the positional arguments passed to the network
+            return module_instance(*call_args, mask=mask, store=store)
+
+        # Apply vmap to the network class
+        ensemble = nn.vmap(
+            self.net_cls,
+            variable_axes={"params": 0, "intermediates": 0},
+            split_rngs={"params": True, "dropout": True},
+            in_axes=None,  # pyright: ignore [reportArgumentType]
+            out_axes=0,
+            axis_size=self.num,
+        )
+
+        # Create the vmapped instances
+        vmapped_modules = ensemble()
+
+        # If we have mask or store, we need to use scan or vmap on the call
+        # But since mask/store are the same for all ensemble members, we can just
+        # modify the apply to broadcast them
+        if mask is not None or store:
+            # Use vmap on the call itself to apply to all ensemble members
+            # Each member gets the same mask and store values (broadcast)
+            return jax.vmap(lambda m: wrapped_call(m, *args))(vmapped_modules)
+        else:
+            return vmapped_modules(*args, **kwargs)
+"""
 
 class Ensemble(nn.Module):
     net_cls: nn.Module | Callable[..., nn.Module]
@@ -268,7 +310,6 @@ class Ensemble(nn.Module):
             axis_size=self.num,
         )
         return ensemble()(*args)
-
 
 class EnsembleMDContinuousActionPolicy(nn.Module):
     """Ensemble ContinusActionPolicy where there is "multiple data" as input.

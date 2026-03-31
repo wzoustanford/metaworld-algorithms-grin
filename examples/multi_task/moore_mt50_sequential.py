@@ -7,7 +7,7 @@ from metaworld_algorithms.config.networks import (
     ContinuousActionPolicyConfig,
     QValueFunctionConfig,
 )
-from metaworld_algorithms.config.nn import MOOREConfig
+from metaworld_algorithms.config.nn import LSTMConfig, MOOREConfig
 from metaworld_algorithms.config.optim import OptimizerConfig
 from metaworld_algorithms.config.rl import OffPolicyTrainingConfig
 from metaworld_algorithms.envs import MetaworldConfig
@@ -57,11 +57,19 @@ def main() -> None:
             # Sequential buffer specific parameters
             rollout_capacity=2000,  # Number of rollouts to store
             max_rollout_steps=500,  # Max steps per rollout
+            # LSTM configuration for temporal learning
+            lstm_config=LSTMConfig(
+                hidden_size=256,  # LSTM hidden state dimension
+                output_size=600,  # Must match MOORE network width
+                optimizer=OptimizerConfig(lr=1e-3, max_grad_norm=1.0),
+            ),
         ),
         training_config=OffPolicyTrainingConfig(
+            warmstart_steps=int(1e3),
             total_steps=int(1e8),
-            buffer_size=int(1e6),  # Not used by MTSACSequential, kept for compatibility
+            buffer_size=int(5e6),  # Not used by MTSACSequential, kept for compatibility
             batch_size=6400,
+            seq_len=200,
         ),
         checkpoint=True,
         resume=args.resume,
